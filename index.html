@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>リアルタイム姿勢分析</title>
+<style>
+  body {
+    font-family: sans-serif;
+    text-align: center;
+    background: #f5f5f5;
+    padding: 16px;
+    margin: 0;
+  }
+  h1 { font-size: 20px; margin-bottom: 12px; }
+
+  .buttons {
+    margin-bottom: 12px;
+  }
+  button {
+    font-size: 16px;
+    padding: 10px 16px;
+    margin: 4px;
+    border-radius: 8px;
+    border: none;
+    background: #333;
+    color: #fff;
+  }
+  button:disabled {
+    background: #aaa;
+  }
+
+  /* カメラ映像とCanvasを重ねて表示するための箱 */
+  /* 実際の幅・高さはJavaScriptから設定する（縦を基準に大きく表示するため） */
+  #cameraWrap {
+    position: relative;
+    margin: 0 auto;
+    background: #000;
+    line-height: 0; /* 余白ができないようにする */
+  }
+  /* videoとcanvasを完全に重ねる */
+  #video, #overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  /* 前面カメラのときだけ左右反転する（鏡のように見せるため） */
+  #cameraWrap.mirrored #video,
+  #cameraWrap.mirrored #overlay {
+    transform: scaleX(-1);
+  }
+
+  #status {
+    margin-top: 12px;
+    color: #444;
+    min-height: 20px;
+  }
+</style>
+</head>
+<body>
+
+  <h1>リアルタイム姿勢分析</h1>
+
+  <div class="buttons">
+    <button id="startBtn">カメラを起動</button>
+    <button id="stopBtn" disabled>カメラ停止</button>
+    <button id="switchBtn" disabled>前面／背面 切替</button>
+  </div>
+
+  <!-- video: カメラ映像を表示する要素 -->
+  <!-- canvas: その上に骨格を描画する透明なレイヤー -->
+  <div id="cameraWrap" class="mirrored">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <p id="status">「カメラを起動」を押してください</p>
+  <p id="angleInfo"></p>
+
+  <!-- TensorFlow.js 本体 -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.11.0/dist/tf-core.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter@4.11.0/dist/tf-converter.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@4.11.0/dist/tf-backend-webgl.min.js"></script>
+  <!-- 姿勢推定モデル（MoveNet） -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2.1.3/dist/pose-detection.min.js"></script>
+
+  <script>
+    // ===== ① 画面部品を変数に入れておく =====
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('overlay');
+    const ctx = canvas.getContext('2d');
+    const cameraWrap = document.getElementById('cameraWrap');
+    const statusText = document.getElementById('status');
+    const angleInfo = document.getElementById('angleInfo');
+
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const switchBtn = document.getElementById('switchBtn');
+
+    // 骨格として線でつなぐ関節のペア
+    const connections = [
+      ['left_shoulder', 'right_shoulder'],
+      ['left_shoulder', 'left_elbow'],
+      ['left_elbow', 'left_wrist'],
+      ['right_shoulder', 'right_elbow'],
+      ['right_elbow', 'right_wrist'],
+      ['left_shoulder', 'left_hip'],
+      ['right_shoulder', 'right_hip'],
+      ['left_hip', 'right_hip'],
+      ['left_hip', 'left_knee'],
+      ['left_knee', 'left_ankle'],
+      ['right_hip', 'right_knee'],
+      ['right_knee', 'right_ankle']
+    ];
+
+    // 状態を管理するための変数
+    let detector = null;       // AIモデルを入れておく箱
+    let stream = null;         // カメラ映像のストリーム
+    let isRunning = false;     // 検出ループを続けるかどうかのフラグ
+    let facingMode = 'user';   // 'user'=前面カメラ, 'environment'=背面カメラ
+    const SCORE_THRESHOLD = 0.3; // これより信頼度が低い関節は描画しない
+
+    // ===== 重心の推定計算に使う比率（MoveNetでは直接検出できないため近似値） =====
+    // 肩の中点(0.0) 〜 股関節の中点(1.0) の間で、上半身質量中心(剣状突起の近似)がある位置
+    const XIPHOID_RATIO = 0.5;
+    // 股関節の中点(0.0) 〜 膝の中点(1.0) の間で、下半身質量中心(大腿近位2/3の近似)がある位置
+    const THIGH_RATIO = 2 / 3;
+
+    // ===== ② AIモデルを読み込む関数（非同期処理） =====
+    async function loadModel() {
+      if (detector) return; // すでに読み込み済みなら何もしない
+      statusText.textContent = 'AIモデルを読み込み中...';
+      detector = await poseDetection.createDetector(
+        poseDetection.SupportedModels.MoveNet,
+        { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING }
+      );
+    }
+
+    // ===== 画面の高さを基準に、カメラ表示の大きさを計算する処理 =====
+    // 横幅ではなく「高さ」を基準にすることで、後ろに下がって全身を映しても
+    // 画面いっぱいに大きく表示できるようにする
+    function resizeCameraDisplay() {
+      // 画面の高さの85%を、カメラ表示に使う高さとする
+      const targetHeight = window.innerHeight * 0.85;
+
+      // カメラ映像自体の縦横比（横 ÷ 縦）を求める
+      const aspectRatio = video.videoWidth / video.videoHeight;
+
+      // 縦横比を保ったまま、高さに合わせた横幅を計算する
+      const targetWidth = targetHeight * aspectRatio;
+
+      // 横幅が画面より広くなりすぎないように調整する
+      const maxWidth = window.innerWidth * 0.95;
+      let finalWidth = targetWidth;
+      let finalHeight = targetHeight;
+      if (targetWidth > maxWidth) {
+        finalWidth = maxWidth;
+        finalHeight = maxWidth / aspectRatio;
+      }
+
+      cameraWrap.style.width = finalWidth + 'px';
+      cameraWrap.style.height = finalHeight + 'px';
+    }
+
+    // ===== ③ カメラを起動する処理 =====
+    async function startCamera() {
+      startBtn.disabled = true;
+
+      // ブラウザがカメラ機能に対応しているかチェック
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        statusText.textContent = 'このブラウザはWebカメラに対応していません。';
+        startBtn.disabled = false;
+        return;
+      }
+
+      try {
+        await loadModel();
+
+        statusText.textContent = 'カメラを起動しています...';
+
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: facingMode,
+            width: { ideal: 1280 },  // できればこの横幅で撮影してほしい、という希望値
+            height: { ideal: 720 }   // カメラが対応していない場合は近い値になる
+          },
+          audio: false
+        });
+
+        video.srcObject = stream;
+
+        // 映像のサイズが確定してからCanvasのサイズを合わせる
+        await new Promise((resolve) => {
+          video.onloadedmetadata = () => {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            resizeCameraDisplay(); // 画面上の表示サイズを計算する
+            resolve();
+          };
+        });
+
+        // 前面カメラのときだけ鏡のように反転表示にする
+        cameraWrap.classList.toggle('mirrored', facingMode === 'user');
+
+        isRunning = true;
+        stopBtn.disabled = false;
+        switchBtn.disabled = false;
+        statusText.textContent = '検出中...';
+
+        detectPose(); // 検出ループ開始
+
+      } catch (error) {
+        // ④ エラーの種類に応じてメッセージを分ける
+        if (error.name === 'NotAllowedError') {
+          statusText.textContent = 'カメラへのアクセスが許可されていません。ブラウザの設定を確認してください。';
+        } else if (error.name === 'NotFoundError') {
+          statusText.textContent = 'カメラが見つかりませんでした。';
+        } else {
+          statusText.textContent = 'カメラの起動に失敗しました：' + error.message;
+        }
+        startBtn.disabled = false;
+      }
+    }
+
+    // ===== ⑤ 姿勢を検出し続けるループ処理 =====
+    async function detectPose() {
+      if (!isRunning) return; // 停止フラグが立っていたらループを抜ける
+
+      const poses = await detector.estimatePoses(video);
+
+      // Canvasを一度クリアしてから描き直す
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      if (poses.length > 0) {
+        drawSkeleton(poses[0].keypoints);
+      }
+
+      // 次のフレームでもう一度この関数を呼ぶ
+      requestAnimationFrame(detectPose);
+    }
+
+    // ===== ⑥ 3つの点から「真ん中の点」の角度を計算する関数 =====
+    // a, b, c はそれぞれ {x, y} を持つ点。角度を知りたいのは b の場所。
+    // 例：肩(a) - 肘(b) - 手首(c) → 肘の曲がり具合が分かる
+    function calculateAngle(a, b, c) {
+      // bからaへ向かうベクトル、bからcへ向かうベクトルを求める
+      const vectorBA = { x: a.x - b.x, y: a.y - b.y };
+      const vectorBC = { x: c.x - b.x, y: c.y - b.y };
+
+      // 2つのベクトルの向きの差から角度（ラジアン）を求める
+      const angleRad =
+        Math.atan2(vectorBC.y, vectorBC.x) - Math.atan2(vectorBA.y, vectorBA.x);
+
+      // ラジアンを度（0〜180）に変換して見やすくする
+      let angleDeg = Math.abs((angleRad * 180) / Math.PI);
+      if (angleDeg > 180) {
+        angleDeg = 360 - angleDeg;
+      }
+      return Math.round(angleDeg);
+    }
+
+    // ===== ⑦ どの関節の角度を計算したいかを「データ」として定義する =====
+    // 3点の名前を [開始点, 角度を知りたい点, 終了点] の順で書く
+    const angleDefinitions = [
+      { label: '左肘',     points: ['left_shoulder', 'left_elbow', 'left_wrist'] },
+      { label: '右肘',     points: ['right_shoulder', 'right_elbow', 'right_wrist'] },
+      { label: '左膝',     points: ['left_hip', 'left_knee', 'left_ankle'] },
+      { label: '右膝',     points: ['right_hip', 'right_knee', 'right_ankle'] },
+      { label: '左股関節', points: ['left_shoulder', 'left_hip', 'left_knee'] },
+      { label: '右股関節', points: ['right_shoulder', 'right_hip', 'right_knee'] }
+    ];
+
+    // ===== ⑧ 定義した関節を1つずつ計算し、画面に表示する処理 =====
+    function showJointAngles(points) {
+      const messages = [];
+
+      angleDefinitions.forEach((def) => {
+        // def.points は ['left_shoulder', 'left_elbow', 'left_wrist'] のような配列
+        // これを3つの変数に分けて受け取る書き方（分割代入という）
+        const [nameA, nameB, nameC] = def.points;
+
+        const a = points[nameA];
+        const b = points[nameB];
+        const c = points[nameC];
+
+        // 3点すべてが、十分な信頼度で検出できているときだけ計算する
+        if (
+          a && b && c &&
+          a.score > SCORE_THRESHOLD &&
+          b.score > SCORE_THRESHOLD &&
+          c.score > SCORE_THRESHOLD
+        ) {
+          const angle = calculateAngle(a, b, c);
+          messages.push(def.label + '：' + angle + '°');
+          drawAngleText(b, angle); // 真ん中の関節(b)の近くに数字を描く
+        }
+      });
+
+      // テキストエリアに結果をまとめて表示する
+      angleInfo.textContent = messages.length > 0 ? messages.join(' / ') : '';
+    }
+
+
+    // Canvas上の関節のすぐ近くに角度の数字を描く
+    function drawAngleText(joint, angleDeg) {
+      ctx.save(); // 今の描画設定を保存しておく
+
+      // 鏡表示で文字が反転して読めなくならないように、文字だけ反転を打ち消す
+      ctx.translate(joint.x, joint.y);
+      ctx.scale(-1, 1);
+
+      ctx.fillStyle = 'yellow';
+      ctx.font = '18px sans-serif';
+      ctx.fillText(angleDeg + '°', 10, -10);
+
+      ctx.restore(); // 保存しておいた設定に戻す
+    }
+
+    // ===== 2点のちょうど真ん中の座標を求める関数 =====
+    function getMidpoint(a, b) {
+      return {
+        x: (a.x + b.x) / 2,
+        y: (a.y + b.y) / 2
+      };
+    }
+
+    // ===== aからbへ向かう直線上を、指定した割合(ratio)だけ進んだ座標を求める関数 =====
+    // ratio = 0 なら a そのもの、ratio = 1 なら b そのもの、0.5なら真ん中
+    function getPointOnLine(a, b, ratio) {
+      return {
+        x: a.x + (b.x - a.x) * ratio,
+        y: a.y + (b.y - a.y) * ratio
+      };
+    }
+
+    // ===== 重心線を計算して描画する処理 =====
+    // 考え方：
+    //   1. 上半身質量中心 ≒ 肩の中点と股関節の中点を結ぶ線上の、XIPHOID_RATIOの位置（剣状突起の近似）
+    //   2. 下半身質量中心 ≒ 股関節の中点と膝の中点を結ぶ線上の、THIGH_RATIOの位置（大腿近位2/3の近似）
+    //      ※膝が検出できていない場合は、股関節の中点をそのまま代わりに使う（簡易版）
+    //   3. 重心点 ＝ 1と2のちょうど中間
+    //   4. 重心点から画面の下端（床）に向かって垂直に線を引く
+    function drawCenterLine(points) {
+      const leftShoulder = points['left_shoulder'];
+      const rightShoulder = points['right_shoulder'];
+      const leftHip = points['left_hip'];
+      const rightHip = points['right_hip'];
+      const leftKnee = points['left_knee'];
+      const rightKnee = points['right_knee'];
+
+      // 肩と股関節（4点）は、最低限これが見えないと計算できない
+      const shouldersDetected =
+        leftShoulder && rightShoulder &&
+        leftShoulder.score > SCORE_THRESHOLD && rightShoulder.score > SCORE_THRESHOLD;
+      const hipsDetected =
+        leftHip && rightHip &&
+        leftHip.score > SCORE_THRESHOLD && rightHip.score > SCORE_THRESHOLD;
+
+      if (!shouldersDetected || !hipsDetected) {
+        return; // 肩・股関節が見えないフレームでは重心を計算しない
+      }
+
+      // 膝（2点）は、あれば精度が上がるが、なくても簡易計算はできる
+      const kneesDetected =
+        leftKnee && rightKnee &&
+        leftKnee.score > SCORE_THRESHOLD && rightKnee.score > SCORE_THRESHOLD;
+
+      // 左右の中点をそれぞれ求める
+      const shoulderMid = getMidpoint(leftShoulder, rightShoulder);
+      const hipMid = getMidpoint(leftHip, rightHip);
+
+      // ① 上半身質量中心（剣状突起の近似位置）
+      const upperBodyCenter = getPointOnLine(shoulderMid, hipMid, XIPHOID_RATIO);
+      drawCenterMarker(upperBodyCenter, 'magenta', 4);
+
+      // ② 下半身質量中心（大腿近位2/3の近似位置）
+      let lowerBodyCenter;
+      if (kneesDetected) {
+        // 膝も検出できている場合：本来の計算方法を使う
+        const kneeMid = getMidpoint(leftKnee, rightKnee);
+        lowerBodyCenter = getPointOnLine(hipMid, kneeMid, THIGH_RATIO);
+        drawCenterMarker(lowerBodyCenter, 'yellow', 4);
+      } else {
+        // 膝が見えない場合：股関節の中点をそのまま代わりに使う（簡易版）
+        lowerBodyCenter = hipMid;
+      }
+
+      // ③ 2つの中心を結んだ、ちょうど真ん中の点＝重心点
+      const centerOfMass = getMidpoint(upperBodyCenter, lowerBodyCenter);
+
+      // ④ 重心点から画面の下端（床）まで、垂直な破線を引く
+      ctx.save();
+      ctx.strokeStyle = 'red';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 6]);
+      ctx.beginPath();
+      ctx.moveTo(centerOfMass.x, centerOfMass.y);
+      ctx.lineTo(centerOfMass.x, canvas.height);
+      ctx.stroke();
+      ctx.restore();
+
+      // 重心点そのものを、少し大きめの丸で強調表示する
+      drawCenterMarker(centerOfMass, 'red', 7);
+    }
+
+    // 指定した座標に、指定した色・大きさの丸を描く（中心点や重心点の表示に使う）
+    function drawCenterMarker(point, color, radius) {
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, radius, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+
+    // ===== ⑨ 関節と骨格線を描画する処理 =====
+    function drawSkeleton(keypoints) {
+      const points = {};
+      keypoints.forEach((kp) => {
+        points[kp.name] = kp;
+      });
+
+      // 関節点を丸で描く
+      ctx.fillStyle = 'red';
+      keypoints.forEach((kp) => {
+        if (kp.score > SCORE_THRESHOLD) {
+          ctx.beginPath();
+          ctx.arc(kp.x, kp.y, 6, 0, 2 * Math.PI);
+          ctx.fill();
+        }
+      });
+
+      // 関節同士を線でつなぐ
+      ctx.strokeStyle = 'lime';
+      ctx.lineWidth = 3;
+      connections.forEach((pair) => {
+        const p1 = points[pair[0]];
+        const p2 = points[pair[1]];
+        if (p1 && p2 && p1.score > SCORE_THRESHOLD && p2.score > SCORE_THRESHOLD) {
+          ctx.beginPath();
+          ctx.moveTo(p1.x, p1.y);
+          ctx.lineTo(p2.x, p2.y);
+          ctx.stroke();
+        }
+      });
+
+      // 各関節の角度を計算して表示する
+      showJointAngles(points);
+
+      // 重心の目安ラインを描画する
+      drawCenterLine(points);
+    }
+
+    // ===== ⑩ カメラを停止する処理 =====
+    function stopCamera() {
+      isRunning = false;
+
+      if (stream) {
+        // カメラのトラック（映像の元）を1つずつ止める
+        stream.getTracks().forEach((track) => track.stop());
+        stream = null;
+      }
+
+      video.srcObject = null;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      switchBtn.disabled = true;
+      statusText.textContent = '停止しました。';
+    }
+
+    // ===== ⑪ 前面／背面カメラを切り替える処理 =====
+    async function switchCamera() {
+      facingMode = (facingMode === 'user') ? 'environment' : 'user';
+      stopCamera();
+      await startCamera();
+    }
+
+    // ===== ⑫ ボタンにイベントを登録する =====
+    startBtn.addEventListener('click', startCamera);
+    stopBtn.addEventListener('click', stopCamera);
+    switchBtn.addEventListener('click', switchCamera);
+  </script>
+
+</body>
+</html>
