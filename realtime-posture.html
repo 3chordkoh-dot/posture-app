@@ -58,6 +58,16 @@
     color: #444;
     min-height: 20px;
   }
+  /* 動画の保存リンクをボタンのように見せる */
+  #downloadLink {
+    display: inline-block;
+    margin-top: 12px;
+    padding: 10px 16px;
+    background: #2e7d32;
+    color: #fff;
+    text-decoration: none;
+    border-radius: 8px;
+  }
 </style>
 </head>
 <body>
@@ -70,6 +80,10 @@
     <button id="switchBtn" disabled>前面／背面 切替</button>
   </div>
 
+  <div class="buttons">
+    <button id="recordBtn" disabled>録画開始</button>
+  </div>
+
   <!-- video: カメラ映像を表示する要素 -->
   <!-- canvas: その上に骨格を描画する透明なレイヤー -->
   <div id="cameraWrap" class="mirrored">
@@ -79,6 +93,9 @@
 
   <p id="status">「カメラを起動」を押してください</p>
   <p id="angleInfo"></p>
+
+  <!-- 録画が完了すると、ここに保存用のリンクが表示される -->
+  <a id="downloadLink" style="display:none;">動画を保存する</a>
 
   <!-- TensorFlow.js 本体 -->
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@4.11.0/dist/tf-core.min.js"></script>
@@ -99,6 +116,8 @@
     const startBtn = document.getElementById('startBtn');
     const stopBtn = document.getElementById('stopBtn');
     const switchBtn = document.getElementById('switchBtn');
+    const recordBtn = document.getElementById('recordBtn');
+    const downloadLink = document.getElementById('downloadLink');
 
     // 骨格として線でつなぐ関節のペア
     const connections = [
@@ -122,6 +141,12 @@
     let isRunning = false;     // 検出ループを続けるかどうかのフラグ
     let facingMode = 'user';   // 'user'=前面カメラ, 'environment'=背面カメラ
     const SCORE_THRESHOLD = 0.3; // これより信頼度が低い関節は描画しない
+
+    // 録画に関する状態変数
+    let canvasStream = null;     // Canvas（骨格入りの映像）から作る動画データの流れ
+    let mediaRecorder = null;    // 録画を行う本体
+    let recordedChunks = [];     // 録画された動画データの断片を集めておく配列
+    let isRecording = false;     // 録画中かどうかのフラグ
 
     // ===== 重心の推定計算に使う比率（MoveNetでは直接検出できないため近似値） =====
     // 肩の中点(0.0) 〜 股関節の中点(1.0) の間で、上半身質量中心(剣状突起の近似)がある位置
@@ -205,9 +230,14 @@
         // 前面カメラのときだけ鏡のように反転表示にする
         cameraWrap.classList.toggle('mirrored', facingMode === 'user');
 
+        // Canvas（骨格が描かれる予定の映像）から、録画用の映像の流れを作っておく
+        // 30 は「1秒間に30コマ」という意味（数字を変えると滑らかさが変わる）
+        canvasStream = canvas.captureStream(30);
+
         isRunning = true;
         stopBtn.disabled = false;
         switchBtn.disabled = false;
+        recordBtn.disabled = false;
         statusText.textContent = '検出中...';
 
         detectPose(); // 検出ループ開始
@@ -452,9 +482,72 @@
       drawCenterLine(points);
     }
 
+    // ===== 録画を開始する処理 =====
+    function startRecording() {
+      recordedChunks = []; // 前回分が残らないよう、まず空にする
+
+      // ブラウザによって対応している動画形式が違うため、使える形式を探す
+      let mimeType = 'video/mp4';
+      if (!MediaRecorder.isTypeSupported(mimeType)) {
+        mimeType = 'video/webm';
+      }
+      if (!MediaRecorder.isTypeSupported(mimeType)) {
+        statusText.textContent = 'このブラウザは動画の録画に対応していません。';
+        return;
+      }
+
+      mediaRecorder = new MediaRecorder(canvasStream, { mimeType: mimeType });
+
+      // 録画データが少したまるたびに、この処理が呼ばれる
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          recordedChunks.push(event.data);
+        }
+      };
+
+      // 録画が停止されたら、保存用のファイルを作る処理を呼ぶ
+      mediaRecorder.onstop = saveRecording;
+
+      mediaRecorder.start();
+      isRecording = true;
+      recordBtn.textContent = '録画停止';
+      downloadLink.style.display = 'none'; // 前回の保存リンクは一旦隠す
+      statusText.textContent = '録画中...';
+    }
+
+    // ===== 録画を停止する処理 =====
+    function stopRecording() {
+      mediaRecorder.stop();
+      isRecording = false;
+      recordBtn.textContent = '録画開始';
+    }
+
+    // ===== 録画データを1つの動画ファイルにまとめて、保存リンクを表示する処理 =====
+    function saveRecording() {
+      // 集めておいた断片(recordedChunks)を、1つの動画データ(Blob)にまとめる
+      const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType });
+
+      // Blobを、ブラウザが扱えるURL（一時的なアドレス）に変換する
+      const url = URL.createObjectURL(blob);
+
+      const extension = mediaRecorder.mimeType.includes('mp4') ? 'mp4' : 'webm';
+
+      downloadLink.href = url;
+      downloadLink.download = 'posture-' + Date.now() + '.' + extension;
+      downloadLink.textContent = '動画を保存する';
+      downloadLink.style.display = 'inline-block';
+
+      statusText.textContent = '録画が完了しました。下のリンクから保存してください。';
+    }
+
     // ===== ⑩ カメラを停止する処理 =====
     function stopCamera() {
       isRunning = false;
+
+      // カメラを止める前に、録画中であれば録画も止めておく
+      if (isRecording) {
+        stopRecording();
+      }
 
       if (stream) {
         // カメラのトラック（映像の元）を1つずつ止める
@@ -468,6 +561,7 @@
       startBtn.disabled = false;
       stopBtn.disabled = true;
       switchBtn.disabled = true;
+      recordBtn.disabled = true;
       statusText.textContent = '停止しました。';
     }
 
@@ -482,6 +576,15 @@
     startBtn.addEventListener('click', startCamera);
     stopBtn.addEventListener('click', stopCamera);
     switchBtn.addEventListener('click', switchCamera);
+
+    // 録画ボタンは、押すたびに「開始」と「停止」を切り替える
+    recordBtn.addEventListener('click', () => {
+      if (isRecording) {
+        stopRecording();
+      } else {
+        startRecording();
+      }
+    });
   </script>
 
 </body>
