@@ -47,11 +47,6 @@
     height: 100%;
     display: block;
   }
-  /* 前面カメラのときだけ左右反転する（鏡のように見せるため） */
-  #cameraWrap.mirrored #video,
-  #cameraWrap.mirrored #overlay {
-    transform: scaleX(-1);
-  }
 
   #status {
     margin-top: 12px;
@@ -86,7 +81,7 @@
 
   <!-- video: カメラ映像を表示する要素 -->
   <!-- canvas: その上に骨格を描画する透明なレイヤー -->
-  <div id="cameraWrap" class="mirrored">
+  <div id="cameraWrap">
     <video id="video" autoplay playsinline muted></video>
     <canvas id="overlay"></canvas>
   </div>
@@ -227,8 +222,7 @@
           };
         });
 
-        // 前面カメラのときだけ鏡のように反転表示にする
-        cameraWrap.classList.toggle('mirrored', facingMode === 'user');
+        // ※左右反転は、この後Canvasに描画するときにまとめて行う
 
         // Canvas（骨格が描かれる予定の映像）から、録画用の映像の流れを作っておく
         // 30 は「1秒間に30コマ」という意味（数字を変えると滑らかさが変わる）
@@ -264,6 +258,9 @@
       // Canvasを一度クリアしてから描き直す
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
+      // まずカメラ映像そのものをCanvasに描く（これがないと録画に映像が映らない）
+      drawVideoFrame();
+
       if (poses.length > 0) {
         drawSkeleton(poses[0].keypoints);
       }
@@ -272,9 +269,27 @@
       requestAnimationFrame(detectPose);
     }
 
+    // ===== 現在のカメラ映像を1コマ分、Canvasに描く処理 =====
+    function drawVideoFrame() {
+      const shouldMirror = (facingMode === 'user'); // 前面カメラのときだけ反転する
+
+      ctx.save(); // 今の描画設定を保存
+
+      if (shouldMirror) {
+        // 横方向だけ反転させる魔法の2行（右端を原点にして、横方向を-1倍にする）
+        ctx.translate(canvas.width, 0);
+        ctx.scale(-1, 1);
+      }
+
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      ctx.restore(); // 保存しておいた設定に戻す（この後の描画には反転が影響しない）
+    }
+
     // ===== ⑥ 3つの点から「真ん中の点」の角度を計算する関数 =====
     // a, b, c はそれぞれ {x, y} を持つ点。角度を知りたいのは b の場所。
     // 例：肩(a) - 肘(b) - 手首(c) → 肘の曲がり具合が分かる
+    // 戻り値は「まっすぐ＝0度、曲がるほど数字が大きくなる」という向きにする
     function calculateAngle(a, b, c) {
       // bからaへ向かうベクトル、bからcへ向かうベクトルを求める
       const vectorBA = { x: a.x - b.x, y: a.y - b.y };
@@ -284,12 +299,16 @@
       const angleRad =
         Math.atan2(vectorBC.y, vectorBC.x) - Math.atan2(vectorBA.y, vectorBA.x);
 
-      // ラジアンを度（0〜180）に変換して見やすくする
-      let angleDeg = Math.abs((angleRad * 180) / Math.PI);
-      if (angleDeg > 180) {
-        angleDeg = 360 - angleDeg;
+      // ラジアンを度に変換する。この時点では「まっすぐ＝180度」の向き
+      let rawAngleDeg = Math.abs((angleRad * 180) / Math.PI);
+      if (rawAngleDeg > 180) {
+        rawAngleDeg = 360 - rawAngleDeg;
       }
-      return Math.round(angleDeg);
+
+      // 180から引くことで、「まっすぐ＝0度」の向きに変換する
+      const jointAngleDeg = 180 - rawAngleDeg;
+
+      return Math.round(jointAngleDeg);
     }
 
     // ===== ⑦ どの関節の角度を計算したいかを「データ」として定義する =====
@@ -336,17 +355,10 @@
 
     // Canvas上の関節のすぐ近くに角度の数字を描く
     function drawAngleText(joint, angleDeg) {
-      ctx.save(); // 今の描画設定を保存しておく
-
-      // 鏡表示で文字が反転して読めなくならないように、文字だけ反転を打ち消す
-      ctx.translate(joint.x, joint.y);
-      ctx.scale(-1, 1);
-
+      // joint はすでに反転後の座標になっているので、そのまま使うだけでよい
       ctx.fillStyle = 'yellow';
       ctx.font = '18px sans-serif';
-      ctx.fillText(angleDeg + '°', 10, -10);
-
-      ctx.restore(); // 保存しておいた設定に戻す
+      ctx.fillText(angleDeg + '°', joint.x + 10, joint.y - 10);
     }
 
     // ===== 2点のちょうど真ん中の座標を求める関数 =====
@@ -446,17 +458,25 @@
 
     // ===== ⑨ 関節と骨格線を描画する処理 =====
     function drawSkeleton(keypoints) {
+      const shouldMirror = (facingMode === 'user'); // 映像と同じ条件で反転する
+
+      // 名前で関節を取り出せるようにしつつ、必要なら左右反転した座標を使う
       const points = {};
       keypoints.forEach((kp) => {
-        points[kp.name] = kp;
+        points[kp.name] = {
+          x: shouldMirror ? canvas.width - kp.x : kp.x,
+          y: kp.y,
+          score: kp.score
+        };
       });
 
       // 関節点を丸で描く
       ctx.fillStyle = 'red';
       keypoints.forEach((kp) => {
-        if (kp.score > SCORE_THRESHOLD) {
+        const p = points[kp.name]; // 反転済みの座標を取り出す
+        if (p.score > SCORE_THRESHOLD) {
           ctx.beginPath();
-          ctx.arc(kp.x, kp.y, 6, 0, 2 * Math.PI);
+          ctx.arc(p.x, p.y, 6, 0, 2 * Math.PI);
           ctx.fill();
         }
       });
